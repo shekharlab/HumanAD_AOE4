@@ -703,6 +703,128 @@ if (file.exists(mathys_sample_key_path)) {
   log_progress(paste("WARNING: Mathys 2020 sample key file not found at:", mathys_sample_key_path, ". Patient IDs will be missing."))
 }
 
+### ===== REMOVING DUPLICATES BEFORE INTEGRATION =====
+log_progress("De-duplication Step 1: Standardizing patient IDs...")
+
+seurat_list <- lapply(seurat_list, function(obj) {
+  potential_id_cols <- c("individualID", "projid", "specimenID", "Sample.ID", "sample_id")
+  cols_to_use <- intersect(potential_id_cols, colnames(obj@meta.data))
+  
+  if (length(cols_to_use) == 0) {
+    obj$unified_patient_id <- NA_character_
+    log_progress(paste("WARNING: No potential patient ID columns found in",
+                       obj$dataset_name[1], "- cells cannot be de-duplicated."))
+    return(obj)
+  }
+  
+  # 1. Isolate only the potential ID columns and add unified ID back to the Seurat object. 
+  id_df <- obj@meta.data[, cols_to_use, drop = FALSE]
+  id_df[] <- lapply(id_df, as.character)
+  unified_id_vector <- do.call(dplyr::coalesce, id_df)
+  obj$unified_patient_id <- unified_id_vector
+  
+  return(obj)
+})
+
+#Creating a master metadata table
+all_metadata <- lapply(names(seurat_list), function(name) {
+  meta <- seurat_list[[name]]@meta.data
+  return(meta[, c("unified_patient_id", "dataset_name")])
+}) %>%
+  bind_rows() %>%
+  filter(!is.na(unified_patient_id))
+
+dataset_priority <- c("mathys_2024", "li", "fujita", "morabito", "mathys_2020", "blanchard")
+
+duplicate_patients <- all_metadata %>%
+  group_by(unified_patient_id) %>%
+  filter(n_distinct(dataset_name) > 1) %>%
+  ungroup()
+
+if (nrow(duplicate_patients) > 0) {
+  datasets_to_keep <- duplicate_patients %>%
+    mutate(dataset_name = factor(dataset_name, levels = dataset_priority)) %>%
+    group_by(unified_patient_id) %>%
+    arrange(dataset_name) %>%
+    slice(1) %>%
+    ungroup()
+  
+  removals <- duplicate_patients %>%
+    anti_join(datasets_to_keep, by = c("unified_patient_id", "dataset_name"))
+  
+  if (nrow(removals) > 0) {
+    log_progress(paste("Found", n_distinct(removals$unified_patient_id), "duplicate patients to handle."))
+    print(removals %>% count(dataset_name, unified_patient_id))
+  }
+} else {
+  removals <- data.frame(unified_patient_id = character(), dataset_name = character()) # Create empty frame if no duplicates
+}
+
+
+#Filtering Seurat objects 
+for (name in names(seurat_list)) {
+  patients_to_remove_from_this_dataset <- removals %>%
+    filter(dataset_name == name) %>%
+    pull(unified_patient_id)
+  
+  if (length(patients_to_remove_from_this_dataset) > 0) {
+    log_progress(paste("In", name, ", flagging cells from",
+                       length(patients_to_remove_from_this_dataset), "duplicate patients for removal."))
+    
+    patient_ids_in_object <- seurat_list[[name]]$unified_patient_id
+    cells_to_remove_mask <- patient_ids_in_object %in% patients_to_remove_from_this_dataset
+    cells_to_remove_mask[is.na(cells_to_remove_mask)] <- FALSE
+    cells_to_keep <- colnames(seurat_list[[name]])[!cells_to_remove_mask]
+    
+    original_cell_count <- ncol(seurat_list[[name]])
+    seurat_list[[name]] <- subset(seurat_list[[name]], cells = cells_to_keep)
+    
+    log_progress(paste("Filtered", name, ": removed",
+                       original_cell_count - ncol(seurat_list[[name]]), "cells. New count:",
+                       ncol(seurat_list[[name]])))
+  } else {
+    log_progress(paste("No duplicate patients to remove from", name))
+  }
+}
+
+
+### ===== NORMALIZE/VARIABLE FEATURES/MERGE INTEGRATED OBJECT =====
+for (name in names(seurat_list)) {
+  log_progress(paste("Processing", name))
+  obj <- seurat_list[[name]]
+  obj <- NormalizeData(obj, verbose = FALSE)
+  obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 3000, verbose = FALSE)
+  seurat_list[[name]] <- obj
+  
+  # Clean up
+  rm(obj)
+  gc()
+}
+
+#Add dataset identifiers
+log_progress("Adding dataset identifiers to each object...")
+
+for(name in names(seurat_list)) {
+  if("dataset_name" %in% colnames(seurat_list[[name]]@meta.data)) {
+    log_progress(paste(name, "already has dataset_name"))
+  } else {
+    log_progress(paste(name, "missing dataset_name - adding it"))
+    seurat_list[[name]]$dataset_name <- name
+  }
+}
+
+
+integrated <- merge(
+  x = seurat_list[[1]],
+  y = seurat_list[2:length(seurat_list)],
+  add.cell.ids = names(seurat_list),
+  project = "AD_Integration"
+)
+
+log_progress(paste("Merged object:", nrow(integrated), "genes,", ncol(integrated), "cells"))
+
+# Clean up
+rm(seurat_list)
 
 ### ===== SEX METADATA MAPPING =====
 log_progress("Establishing ID mapping...")
@@ -923,130 +1045,6 @@ merged_metadata_ordered$APOE_Final <- case_when(
 )
 integrated$APOE_Final <- merged_metadata_ordered$APOE_Final
 log_progress("Created the 'APOE_Category' column.")
-
-
-### ===== REMOVING DUPLICATES BEFORE INTEGRATION =====
-log_progress("De-duplication Step 1: Standardizing patient IDs...")
-
-seurat_list <- lapply(seurat_list, function(obj) {
-  potential_id_cols <- c("individualID", "projid", "specimenID", "Sample.ID", "sample_id")
-  cols_to_use <- intersect(potential_id_cols, colnames(obj@meta.data))
-  
-  if (length(cols_to_use) == 0) {
-    obj$unified_patient_id <- NA_character_
-    log_progress(paste("WARNING: No potential patient ID columns found in",
-                       obj$dataset_name[1], "- cells cannot be de-duplicated."))
-    return(obj)
-  }
-  
-  # 1. Isolate only the potential ID columns and add unified ID back to the Seurat object. 
-  id_df <- obj@meta.data[, cols_to_use, drop = FALSE]
-  id_df[] <- lapply(id_df, as.character)
-  unified_id_vector <- do.call(dplyr::coalesce, id_df)
-  obj$unified_patient_id <- unified_id_vector
-  
-  return(obj)
-})
-
-#Creating a master metadata table
-all_metadata <- lapply(names(seurat_list), function(name) {
-  meta <- seurat_list[[name]]@meta.data
-  return(meta[, c("unified_patient_id", "dataset_name")])
-}) %>%
-  bind_rows() %>%
-  filter(!is.na(unified_patient_id))
-
-dataset_priority <- c("mathys_2024", "li", "fujita", "morabito", "mathys_2020", "blanchard")
-
-duplicate_patients <- all_metadata %>%
-  group_by(unified_patient_id) %>%
-  filter(n_distinct(dataset_name) > 1) %>%
-  ungroup()
-
-if (nrow(duplicate_patients) > 0) {
-  datasets_to_keep <- duplicate_patients %>%
-    mutate(dataset_name = factor(dataset_name, levels = dataset_priority)) %>%
-    group_by(unified_patient_id) %>%
-    arrange(dataset_name) %>%
-    slice(1) %>%
-    ungroup()
-  
-  removals <- duplicate_patients %>%
-    anti_join(datasets_to_keep, by = c("unified_patient_id", "dataset_name"))
-  
-  if (nrow(removals) > 0) {
-    log_progress(paste("Found", n_distinct(removals$unified_patient_id), "duplicate patients to handle."))
-    print(removals %>% count(dataset_name, unified_patient_id))
-  }
-} else {
-  removals <- data.frame(unified_patient_id = character(), dataset_name = character()) # Create empty frame if no duplicates
-}
-
-
-#Filtering Seurat objects 
-for (name in names(seurat_list)) {
-  patients_to_remove_from_this_dataset <- removals %>%
-    filter(dataset_name == name) %>%
-    pull(unified_patient_id)
-  
-  if (length(patients_to_remove_from_this_dataset) > 0) {
-    log_progress(paste("In", name, ", flagging cells from",
-                       length(patients_to_remove_from_this_dataset), "duplicate patients for removal."))
-    
-    patient_ids_in_object <- seurat_list[[name]]$unified_patient_id
-    cells_to_remove_mask <- patient_ids_in_object %in% patients_to_remove_from_this_dataset
-    cells_to_remove_mask[is.na(cells_to_remove_mask)] <- FALSE
-    cells_to_keep <- colnames(seurat_list[[name]])[!cells_to_remove_mask]
-    
-    original_cell_count <- ncol(seurat_list[[name]])
-    seurat_list[[name]] <- subset(seurat_list[[name]], cells = cells_to_keep)
-    
-    log_progress(paste("Filtered", name, ": removed",
-                       original_cell_count - ncol(seurat_list[[name]]), "cells. New count:",
-                       ncol(seurat_list[[name]])))
-  } else {
-    log_progress(paste("No duplicate patients to remove from", name))
-  }
-}
-
-
-### ===== NORMALIZE/VARIABLE FEATURES/MERGE INTEGRATED OBJECT =====
-for (name in names(seurat_list)) {
-  log_progress(paste("Processing", name))
-  obj <- seurat_list[[name]]
-  obj <- NormalizeData(obj, verbose = FALSE)
-  obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 3000, verbose = FALSE)
-  seurat_list[[name]] <- obj
-  
-  # Clean up
-  rm(obj)
-  gc()
-}
-
-#Add dataset identifiers
-log_progress("Adding dataset identifiers to each object...")
-
-for(name in names(seurat_list)) {
-  if("dataset_name" %in% colnames(seurat_list[[name]]@meta.data)) {
-    log_progress(paste(name, "already has dataset_name"))
-  } else {
-    log_progress(paste(name, "missing dataset_name - adding it"))
-    seurat_list[[name]]$dataset_name <- name
-  }
-}
-
-
-integrated <- merge(
-  x = seurat_list[[1]],
-  y = seurat_list[2:length(seurat_list)],
-  add.cell.ids = names(seurat_list),
-  project = "AD_Integration"
-)
-
-log_progress(paste("Merged object:", nrow(integrated), "genes,", ncol(integrated), "cells"))
-
-# Clean up
-rm(seurat_list)
 
 
 ### ===== CREATE BRAIN REGION VARIABLE =====
